@@ -16,7 +16,7 @@ in .env file replace DB_URI with your mongodb connection string. Replica set is 
 
 ## app.ts
 
-Generates 10 to 20 fake customers and inserts it into `customers` every 200ms.
+Generates 1 to 10 fake customers and inserts it into `customers` every 200ms.
 
 ## sync.ts
 
