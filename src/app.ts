@@ -4,8 +4,8 @@ import { getFakeCustomers } from "./service/customers";
 import getRandomCount from "./service/getRandomCount";
 import { Customer } from "./models/customer";
 
-const MIN_CUSTOMERS = 10;
-const MAX_CUSTOMERS = 20;
+const MIN_CUSTOMERS = 1;
+const MAX_CUSTOMERS = 10;
 const INTERVAL = 200;
 
 run();

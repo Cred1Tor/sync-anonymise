@@ -1,3 +1,5 @@
+import mongoose from "mongoose";
+
 export default interface CustomerInterface {
   firstName: string;
   lastName: string;
@@ -11,4 +13,8 @@ export default interface CustomerInterface {
     country: string;
   };
   createdAt: Date;
+}
+
+export interface CustomerWithId extends CustomerInterface {
+  _id: mongoose.Types.ObjectId;
 }

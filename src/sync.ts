@@ -1,6 +1,6 @@
 import "dotenv/config";
 import mongoose from "mongoose";
-import { Customer, CustomerAnonymised } from "./models/customer";
+import { Customer } from "./models/customer";
 import {
   anonymiseCustomer,
   anonymisePartialCustomer,
@@ -11,6 +11,7 @@ import {
   updateSinceLastOnline,
   insertAnonymisedCustomers,
   updateAnonymisedCustomers,
+  anonymiseAndReindexCustomers,
 } from "./service/sync";
 
 const INTERVAL = 1000;
@@ -18,7 +19,6 @@ export const MAX_BATCH_SIZE = 1000;
 
 async function runInSyncMode(): Promise<void> {
   await mongoose.connect(process.env.DB_URI);
-  await updateSinceLastOnline();
 
   const changeStream = Customer.watch();
   let additions: CustomerInterface[] = [];
@@ -61,6 +61,8 @@ async function runInSyncMode(): Promise<void> {
       lastInsertTime = Date.now();
     }
   }, INTERVAL);
+
+  await updateSinceLastOnline();
 }
 
 async function runInFullReindexMode(): Promise<void> {
@@ -68,7 +70,7 @@ async function runInFullReindexMode(): Promise<void> {
 
   for (let i = 0; ; i++) {
     const customers = await Customer.find()
-      .sort("createdAt")
+      .sort("_id")
       .skip(i * MAX_BATCH_SIZE)
       .limit(MAX_BATCH_SIZE)
       .lean();
@@ -78,29 +80,7 @@ async function runInFullReindexMode(): Promise<void> {
       return;
     }
 
-    const anonymisedCustomers = customers.map(anonymiseCustomer);
-
-    const bulkOps = anonymisedCustomers.map((doc) => {
-      return {
-        updateOne: {
-          filter: { _id: doc._id },
-          update: { $set: doc },
-          upsert: true,
-        },
-      };
-    });
-
-    await CustomerAnonymised.bulkWrite(bulkOps)
-      .then((result) => {
-        result.modifiedCount &&
-          console.log(`Modified ${result.modifiedCount} customers`);
-        result.upsertedCount &&
-          console.log(`Upserted ${result.upsertedCount} customers`);
-      })
-      .catch((error) => {
-        console.error("Error reindexing customers:", error);
-        process.exit(1);
-      });
+    await anonymiseAndReindexCustomers(customers);
   }
 }
 

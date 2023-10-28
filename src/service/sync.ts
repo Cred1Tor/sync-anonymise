@@ -1,136 +1,57 @@
 import mongoose from "mongoose";
-import { CustomerAnonymised } from "../models/customer";
-import {
-  ChangeStreamUpdateData,
-  CustomerUpdateOplog,
-  Update,
-  AddressKey,
-  CustomerOplog,
-} from "../types/mongo.types";
-import CustomerInterface from "../types/customer.interface";
-import PartialCustomerInterface from "../types/partialCustomer.interface";
-import { anonymiseCustomer, anonymisePartialCustomer } from "./anonymise";
+import { Customer, CustomerAnonymised } from "../models/customer";
+import { ChangeStreamUpdateData, CustomerOplog } from "../types/mongo.types";
+import CustomerInterface, { CustomerWithId } from "../types/customer.interface";
+import { anonymiseCustomer } from "./anonymise";
 import { MAX_BATCH_SIZE } from "../sync";
 
-export function insertAnonymisedCustomers(
+export async function insertAnonymisedCustomers(
   docs: CustomerInterface[]
-): Promise<any> {
+): Promise<void> {
   return CustomerAnonymised.insertMany(docs)
-    .then(
-      (result) =>
-        result.length &&
+    .then((result) => {
+      if (result.length) {
         console.log(
           `${result.length} customers successfully anonymised and inserted`
-        )
-    )
+        );
+      }
+    })
     .catch((error) => {
       console.error(error);
       process.exit(1);
     });
 }
 
-function updateAnonymisedCustomer(
-  updateData: ChangeStreamUpdateData
-): Promise<any> {
-  return CustomerAnonymised.findByIdAndUpdate(updateData._id, {
-    $set: updateData.updatedFields,
-    $unset: updateData.removedFields.reduce(
-      (acc, propertyName) => ({ ...acc, [propertyName]: "" }),
-      {}
-    ),
-  });
-}
-
-export function updateAnonymisedCustomers(
+export async function updateAnonymisedCustomers(
   updates: ChangeStreamUpdateData[]
-): Promise<any> {
-  return Promise.all(updates.map((update) => updateAnonymisedCustomer(update)))
-    .then(
-      () =>
-        updates.length &&
-        console.log(
-          `${updates.length} customers successfully anonymised and updated`
-        )
-    )
+): Promise<void> {
+  const bulkOps = updates.map((update) => {
+    return {
+      updateOne: {
+        filter: { _id: update._id },
+        update: {
+          $set: update.updatedFields,
+          $unset: update.removedFields.reduce(
+            (acc, propertyName) => ({ ...acc, [propertyName]: "" }),
+            {}
+          ),
+        },
+        upsert: true,
+      },
+    };
+  });
+
+  return CustomerAnonymised.bulkWrite(bulkOps)
+    .then((result) => {
+      result.modifiedCount &&
+        console.log(`Modified ${result.modifiedCount} customers`);
+      result.upsertedCount &&
+        console.log(`Upserted ${result.upsertedCount} customers`);
+    })
     .catch((error) => {
-      console.error("Error updating anonymised characters:", error);
+      console.error("Error updating customers:", error);
       process.exit(1);
     });
-}
-
-function formUpdateFromOplog(
-  oplog: CustomerUpdateOplog
-): [mongoose.Types.ObjectId, Update] {
-  const update: Update = { $set: {}, $unset: {} };
-  const partialCustomer: PartialCustomerInterface = {};
-  const { saddress, i, u, d } = oplog.o.diff;
-  Object.assign(partialCustomer, u, i);
-  Object.assign(update.$unset, d);
-
-  if (saddress) {
-    const { i, u, d } = saddress;
-    Object.entries(Object.assign({}, i, u)).forEach((entry) => {
-      const key = entry[0] as AddressKey;
-      const value = entry[1];
-      partialCustomer[`address.${key}`] = value;
-    });
-    Object.keys(Object.assign({}, d)).forEach((key) => {
-      update.$unset[`address.${key}`] = false;
-    });
-  }
-
-  update.$set = {
-    ...update.$set,
-    ...anonymisePartialCustomer(partialCustomer),
-  };
-
-  return [oplog.o2._id, update];
-}
-
-function updateFromOplogs(oplogs: CustomerOplog[]): Promise<any> {
-  const docsToInsert: CustomerInterface[] = [];
-  const docsToUpdate: [mongoose.Types.ObjectId, Update][] = [];
-
-  oplogs.forEach((oplog) => {
-    if (oplog.op === "i") {
-      docsToInsert.push(anonymiseCustomer(oplog.o));
-    }
-
-    if (oplog.op === "u") {
-      docsToUpdate.push(formUpdateFromOplog(oplog));
-    }
-  });
-
-  return Promise.all([
-    CustomerAnonymised.insertMany(docsToInsert)
-      .then(
-        (result) =>
-          result.length &&
-          console.log(
-            `Inserted ${result.length} new customers since last online`
-          )
-      )
-      .catch((error) => {
-        console.error("Eror inserting customers:", error);
-        process.exit(1);
-      }),
-    Promise.all(
-      docsToUpdate.map(([_id, update]) =>
-        CustomerAnonymised.findByIdAndUpdate(_id, update)
-      )
-    )
-      .then(
-        () =>
-          docsToUpdate.length &&
-          console.log(
-            `Updated ${docsToUpdate.length} customers since last online`
-          )
-      )
-      .catch((error) => {
-        console.error("Eror updating customers:", error);
-        process.exit(1);
-      }),
-  ]);
 }
 
 export async function updateSinceLastOnline(): Promise<void> {
@@ -147,15 +68,46 @@ export async function updateSinceLastOnline(): Promise<void> {
   const ts = lastCustomerAnonymisedUpdate?.ts;
 
   for (let i = 0; ; i++) {
-    const customersOplogs = (await Oplog.find(
+    const customerOplogs = (await Oplog.find(
       { ns: { $regex: "customers$" }, ...(ts && { ts: { $gt: ts } }) },
       { sort: [["ts", 1]], skip: i * MAX_BATCH_SIZE, limit: MAX_BATCH_SIZE }
     ).toArray()) as unknown as CustomerOplog[];
 
-    if (!customersOplogs.length) {
+    const customerIds = customerOplogs.map((oplog) => oplog.o2._id);
+
+    if (!customerIds.length) {
       return;
     }
 
-    await updateFromOplogs(customersOplogs);
+    const customers = await Customer.find({ _id: { $in: customerIds } }).lean();
+    await anonymiseAndReindexCustomers(customers);
   }
+}
+
+export async function anonymiseAndReindexCustomers(
+  customers: CustomerWithId[]
+): Promise<void> {
+  const anonymisedCustomers = customers.map(anonymiseCustomer);
+
+  const bulkOps = anonymisedCustomers.map((doc) => {
+    return {
+      updateOne: {
+        filter: { _id: doc._id },
+        update: { $set: doc },
+        upsert: true,
+      },
+    };
+  });
+
+  return CustomerAnonymised.bulkWrite(bulkOps)
+    .then((result) => {
+      result.modifiedCount &&
+        console.log(`Modified ${result.modifiedCount} customers`);
+      result.upsertedCount &&
+        console.log(`Upserted ${result.upsertedCount} customers`);
+    })
+    .catch((error) => {
+      console.error("Error reindexing customers:", error);
+      process.exit(1);
+    });
 }
